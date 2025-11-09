@@ -7,6 +7,7 @@ import { pipeEvents } from './utils/internal/pipeEvents'
 import { toReadonlyArray } from './utils/internal/toReadonlyArray'
 import { Disposable } from './utils/internal/Disposable'
 import type { WebSocketHandler } from './handlers/WebSocketHandler'
+import { GraphQLBatchHandler } from './handlers/GraphQLBatchHandler'
 
 export abstract class HandlersController {
   abstract prepend(
@@ -73,6 +74,9 @@ export abstract class SetupApi<EventsMap extends EventMap> extends Disposable {
       this.emitter.removeAllListeners()
       this.publicEmitter.removeAllListeners()
     })
+
+    // Inject handlers into any batch handlers
+    this.injectHandlersIntoBatchHandlers()
   }
 
   private validateHandlers(handlers: ReadonlyArray<unknown>): boolean {
@@ -91,6 +95,24 @@ export abstract class SetupApi<EventsMap extends EventMap> extends Disposable {
     )
 
     this.handlersController.prepend(runtimeHandlers)
+
+    // Inject handlers into any batch handlers
+    this.injectHandlersIntoBatchHandlers()
+  }
+
+  private injectHandlersIntoBatchHandlers(): void {
+    const currentHandlers = this.handlersController.currentHandlers()
+
+    for (const handler of currentHandlers) {
+      if (handler instanceof GraphQLBatchHandler) {
+        // Filter out the batch handler itself and keep only RequestHandlers
+        const handlersForBatch = currentHandlers.filter(
+          (h): h is RequestHandler =>
+            h !== handler && 'info' in h && 'run' in h && 'predicate' in h,
+        )
+        handler.setHandlers(handlersForBatch)
+      }
+    }
   }
 
   public restoreHandlers(): void {
