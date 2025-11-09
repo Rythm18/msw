@@ -13,6 +13,7 @@ import {
   GraphQLQuery,
   GraphQLCustomPredicate,
 } from './handlers/GraphQLHandler'
+import { createGraphQLBatchHandler } from './handlers/GraphQLBatchHandler'
 import type { Path } from './utils/matching/matchRequestUrl'
 
 export interface TypedDocumentNode<
@@ -142,4 +143,14 @@ export const graphql = {
    * @see {@link https://mswjs.io/docs/api/graphql#graphqllinkurl `graphql.link()` API reference}
    */
   link: createGraphQLLink,
+
+  /**
+   * Intercepts batched GraphQL operations sent as an array.
+   *
+   * @example
+   * graphql.batch('https://api.example.com/graphql')
+   *
+   * @see {@link https://mswjs.io/docs/api/graphql#graphqlbatchurl `graphql.batch()` API reference}
+   */
+  batch: createGraphQLBatchHandler,
 }

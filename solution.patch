@@ -1,0 +1,227 @@
+diff --git a/src/core/SetupApi.ts b/src/core/SetupApi.ts
+index e908e59..00923fb 100644
+--- a/src/core/SetupApi.ts
++++ b/src/core/SetupApi.ts
+@@ -7,6 +7,7 @@ import { pipeEvents } from './utils/internal/pipeEvents'
+ import { toReadonlyArray } from './utils/internal/toReadonlyArray'
+ import { Disposable } from './utils/internal/Disposable'
+ import type { WebSocketHandler } from './handlers/WebSocketHandler'
++import { GraphQLBatchHandler } from './handlers/GraphQLBatchHandler'
+ 
+ export abstract class HandlersController {
+   abstract prepend(
+@@ -73,6 +74,9 @@ export abstract class SetupApi<EventsMap extends EventMap> extends Disposable {
+       this.emitter.removeAllListeners()
+       this.publicEmitter.removeAllListeners()
+     })
++    
++    // Inject handlers into any batch handlers
++    this.injectHandlersIntoBatchHandlers()
+   }
+ 
+   private validateHandlers(handlers: ReadonlyArray<unknown>): boolean {
+@@ -91,6 +95,24 @@ export abstract class SetupApi<EventsMap extends EventMap> extends Disposable {
+     )
+ 
+     this.handlersController.prepend(runtimeHandlers)
++    
++    // Inject handlers into any batch handlers
++    this.injectHandlersIntoBatchHandlers()
++  }
++  
++  private injectHandlersIntoBatchHandlers(): void {
++    const currentHandlers = this.handlersController.currentHandlers()
++    
++    for (const handler of currentHandlers) {
++      if (handler instanceof GraphQLBatchHandler) {
++        // Filter out the batch handler itself and keep only RequestHandlers
++        const handlersForBatch = currentHandlers.filter(
++          (h): h is RequestHandler =>
++            h !== handler && 'info' in h && 'run' in h && 'predicate' in h,
++        )
++        handler.setHandlers(handlersForBatch)
++      }
++    }
+   }
+ 
+   public restoreHandlers(): void {
+diff --git a/src/core/graphql.ts b/src/core/graphql.ts
+index afd8285..943bc3d 100644
+--- a/src/core/graphql.ts
++++ b/src/core/graphql.ts
+@@ -13,6 +13,7 @@ import {
+   GraphQLQuery,
+   GraphQLCustomPredicate,
+ } from './handlers/GraphQLHandler'
++import { createGraphQLBatchHandler } from './handlers/GraphQLBatchHandler'
+ import type { Path } from './utils/matching/matchRequestUrl'
+ 
+ export interface TypedDocumentNode<
+@@ -142,4 +143,14 @@ export const graphql = {
+    * @see {@link https://mswjs.io/docs/api/graphql#graphqllinkurl `graphql.link()` API reference}
+    */
+   link: createGraphQLLink,
++
++  /**
++   * Intercepts batched GraphQL operations sent as an array.
++   *
++   * @example
++   * graphql.batch('https://api.example.com/graphql')
++   *
++   * @see {@link https://mswjs.io/docs/api/graphql#graphqlbatchurl `graphql.batch()` API reference}
++   */
++  batch: createGraphQLBatchHandler,
+ }
+diff --git a/src/core/handlers/GraphQLBatchHandler.ts b/src/core/handlers/GraphQLBatchHandler.ts
+new file mode 100644
+index 0000000..b6121a6
+--- /dev/null
++++ b/src/core/handlers/GraphQLBatchHandler.ts
+@@ -0,0 +1,147 @@
++import { HttpHandler, HttpMethods } from './HttpHandler'
++import { HttpResponse } from '../HttpResponse'
++import type { Path } from '../utils/matching/matchRequestUrl'
++import type { RequestHandler } from './RequestHandler'
++import { bypass } from '../bypass'
++import { executeHandlers } from '../utils/executeHandlers'
++import { createRequestId } from '@mswjs/interceptors'
++
++export interface GraphQLBatchOperation {
++  query: string
++  variables?: Record<string, any>
++  operationName?: string
++}
++
++/**
++ * Internal registry to store handlers for batch processing.
++ * This allows batch handlers to access all registered GraphQL handlers.
++ */
++const handlersRegistry = new WeakMap<
++  GraphQLBatchHandler,
++  Array<RequestHandler>
++>()
++
++/**
++ * A specialized HTTP handler for GraphQL batch operations.
++ * Intercepts array-formatted batch requests and routes each operation
++ * to appropriate GraphQL handlers.
++ */
++export class GraphQLBatchHandler extends HttpHandler {
++  constructor(endpoint: Path) {
++    // Create base HTTP POST handler for the batch endpoint
++    super(
++      HttpMethods.POST,
++      endpoint,
++      async ({ request }) => {
++        // Clone request to avoid consuming the original
++        const requestForPeeking = request.clone()
++        let operations: Array<GraphQLBatchOperation>
++
++        try {
++          const body = await requestForPeeking.json()
++
++          // Only handle array-formatted batch requests
++          if (!Array.isArray(body)) {
++            return undefined
++          }
++
++          operations = body
++        } catch {
++          // Invalid JSON or non-JSON body, let other handlers process it
++          return undefined
++        }
++
++        // Handle empty batch
++        if (operations.length === 0) {
++          return HttpResponse.json([])
++        }
++
++        // Get handlers from registry
++        const handlers = handlersRegistry.get(this) || []
++        
++        // Clone for creating individual operation requests
++        const requestClone = request.clone()
++
++        // Process each operation in the batch
++        const responses = await Promise.all(
++          operations.map(async (operation) => {
++            try {
++              // Create a new request for this individual operation
++              const operationRequest = new Request(requestClone.url, {
++                method: 'POST',
++                headers: requestClone.headers,
++                body: JSON.stringify(operation),
++              })
++
++              // Try to find a matching handler for this operation
++              const result = await executeHandlers({
++                request: operationRequest,
++                requestId: createRequestId(),
++                handlers,
++              })
++
++              if (result?.response) {
++                // Handler found, return its response
++                return await result.response.json()
++              }
++
++              // No handler matched, pass through to actual server
++              // Send as single operation (server will handle it as non-batch)
++              const passthroughRequest = new Request(requestClone.url, {
++                method: 'POST',
++                headers: requestClone.headers,
++                body: JSON.stringify(operation),
++              })
++
++              const passthroughResponse = await fetch(
++                bypass(passthroughRequest),
++              )
++              return await passthroughResponse.json()
++            } catch (error) {
++              // Return error response for this operation
++              return {
++                errors: [
++                  {
++                    message:
++                      error instanceof Error
++                        ? error.message
++                        : 'Unknown error processing operation',
++                  },
++                ],
++              }
++            }
++          }),
++        )
++
++        return HttpResponse.json(responses)
++      },
++    )
++  }
++
++  /**
++   * Sets the handlers that this batch handler should route to.
++   * @internal
++   */
++  setHandlers(handlers: Array<RequestHandler>): void {
++    handlersRegistry.set(this, handlers)
++  }
++}
++
++/**
++ * Creates a GraphQL batch operation handler.
++ *
++ * @example
++ * const api = graphql.link('https://api.example.com/graphql')
++ * setupServer(
++ *   api.query('GetUser', resolver),
++ *   api.query('GetProduct', resolver),
++ *   graphql.batch('https://api.example.com/graphql')
++ * )
++ *
++ * @param endpoint - The URL or path to intercept batch requests
++ */
++export function createGraphQLBatchHandler(
++  endpoint: Path,
++): GraphQLBatchHandler {
++  return new GraphQLBatchHandler(endpoint)
++}
